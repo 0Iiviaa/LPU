@@ -7,7 +7,7 @@
 //    · mac使能只看out_ready，out_ready = 1 时计算新输出，out_ready = 0 时mac的输出保持，防止丢弃有效数据
 //    · in_vaild无效要让流水线停住，但是不能让mac的计算停住，防止正在计算的有效数据卡住
 //    · mac使能有效即计算，则此时mac的输入数据必须有效，所以rom和ram的读使能和mac一致，控制信号延迟使能也和mac一致
-//    · flush机制通过pipe_en和pipe_en_out分离实现，只需要再in_valid=0时拉低is_lst_kk_fi_d0，out_ready会在pipe_en_out驱动的延迟后拉低
+//    · flush机制通过pipe_en和pipe_en_out分离实现，只需要在in_valid=0时拉低is_lst_kk_fi_d0，out_ready会在pipe_en_out驱动的延迟后拉低
 // ---------------------------------------------------
 
 module conv #(
