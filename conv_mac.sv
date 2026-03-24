@@ -49,7 +49,6 @@ module conv_mac_tail #(
 
     assign tail_prod = x_tail * w_tail;       
 
-    // 清零且数据无效，清零指舍弃之前的accr，数据无效指cascade内数据舍弃，也就是直接把accr赋值0
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             tail_acc_r <= '0;
@@ -74,8 +73,8 @@ module conv_mac_array #(
     input  logic                   clk,
     input  logic                   rst_n,
     input  logic                   en,
-    input  logic                   dat_vld,            // mac的输入有效
-    input  logic                   clr,                // 第一个元素位置，清零
+    input  logic                   dat_vld,
+    input  logic                   clr,
     input  logic        [A_BIT-1:0] x_vec  [P_ICH],
     input  logic signed [W_BIT-1:0] w_vec  [P_ICH],
     output logic signed [B_BIT-1:0] acc
