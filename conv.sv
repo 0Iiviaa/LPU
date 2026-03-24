@@ -1,3 +1,15 @@
+// ---------------------------------------------------
+// 修改：
+// 1. 第一个fo也从ram读数据，减少分支
+// 2. 统一代码形式，方便对齐
+// 3. 数据和权重斜化放进mac内部
+// 4. 流水线驱动简化：
+//    · mac使能只看out_ready，out_ready = 1 时计算新输出，out_ready = 0 时mac的输出保持，防止丢弃有效数据
+//    · in_vaild无效要让流水线停住，但是不能让mac的计算停住，防止正在计算的有效数据卡住
+//    · mac使能有效即计算，则此时mac的输入数据必须有效，所以rom和ram的读使能和mac一致，控制信号延迟使能也和mac一致
+//    · flush机制通过pipe_en和pipe_en_out分离实现，只需要再in_valid=0时拉低is_lst_kk_fi_d0，out_ready会在pipe_en_out驱动的延迟后拉低
+// ---------------------------------------------------
+
 module conv #(
     parameter int unsigned P_ICH      = 4,
     parameter int unsigned P_OCH      = 4,
@@ -33,30 +45,57 @@ module conv #(
     logic        [    $clog2(FOLD_O+1)-1:0] cntr_fo;
     logic        [    $clog2(FOLD_I+1)-1:0] cntr_fi;
     logic        [        $clog2(KK+1)-1:0] cntr_kk;
-    
+    logic                                   pipe_en;
     logic                                   pipe_en_in;
     logic                                   pipe_en_out;
-    // --- 流水线前后端分离使能信号 ---
-    logic                                   pipe_en_frontend;
-    logic                                   pipe_en_backend;
-    logic        [               P_ICH-1:0] out_vld_sr;
-    logic                                   is_flushing;
-    logic                                   out_vld_pre;
-    // ------------------------------------
-    logic                                   is_fst_fo;
-    logic                                   mac_array_data_vld;
     logic        [         P_ICH*A_BIT-1:0] in_buf;
-    logic                                   is_fst_kk_fi;
-    logic                                   is_lst_kk_fi;
+    logic                                   is_fst_fo_d0;
+    logic                                   is_fst_fo_d1;
+    logic                                   is_fst_fo_d2;
+    logic        [         P_ICH*A_BIT-1:0] in_data_d1;
+    logic        [         P_ICH*A_BIT-1:0] in_data_d2;
+    logic                                   is_fst_kk_fi_d0;
+    logic                                   is_fst_kk_fi_d1;
+    logic                                   is_fst_kk_fi_d2;
+    logic                                   is_fst_kk_fi_delayed;
+    logic                                   is_lst_kk_fi_d0;
+    logic                                   is_lst_kk_fi_d1;
+    logic                                   is_lst_kk_fi_d2;
+    logic                                   is_lst_kk_fi_delayed;
     logic                                   line_buffer_we;
-    logic        [           LB_AWIDTH-1:0] line_buffer_waddr;
-    logic        [         P_ICH*A_BIT-1:0] line_buffer_wdata;
+    logic        [           LB_AWIDTH-1:0] line_buffer_waddr_d0;
+    logic        [         P_ICH*A_BIT-1:0] line_buffer_wdata_d0;
     logic                                   line_buffer_re;
-    logic        [           LB_AWIDTH-1:0] line_buffer_raddr;
-    logic        [         P_ICH*A_BIT-1:0] line_buffer_rdata;
-    logic        [$clog2(WEIGHT_DEPTH)-1:0] weight_addr;
-    logic        [   P_OCH*P_ICH*W_BIT-1:0] weight_data;
+    logic        [           LB_AWIDTH-1:0] line_buffer_raddr_d0;
+    logic        [           LB_AWIDTH-1:0] line_buffer_raddr_d1;
+    logic        [         P_ICH*A_BIT-1:0] line_buffer_rdata_d2;
+    logic        [$clog2(WEIGHT_DEPTH)-1:0] weight_addr_d0;
+    logic        [   P_OCH*P_ICH*W_BIT-1:0] weight_data_d1;
+    logic        [   P_OCH*P_ICH*W_BIT-1:0] weight_data_d2;
+    logic                                   mac_array_data_vld_d0;
+    logic                                   mac_array_data_vld_d1;
+    logic                                   mac_array_data_vld_d2;
+    logic                                   mac_array_data_vld_delayed;
 
+
+
+    assign is_fst_fo_d0             = (cntr_fo == 0);
+    assign is_fst_kk_fi_d0          = (cntr_kk == 0) && (cntr_fi == 0);       
+    assign is_lst_kk_fi_d0          = (cntr_kk == KK - 1) && (cntr_fi == FOLD_I - 1) && pipe_en_in;     
+    assign pipe_en_in               = is_fst_fo_d0 ? in_valid : 1'b1;
+    assign pipe_en_out              = (!out_valid || out_ready);        // 只有out_valid = 1 且 out_ready = 0时流水线停住
+    assign pipe_en                  = pipe_en_in && (!out_valid || out_ready);
+    assign in_ready                 = is_fst_fo_d0 && pipe_en_out;
+    assign weight_addr_d0           = (cntr_fo * KK * FOLD_I) + cntr_fi * KK + cntr_kk;
+    assign line_buffer_we           = is_fst_fo_d0 && in_valid;
+    assign line_buffer_waddr_d0     = cntr_fi * KK + cntr_kk;
+    assign line_buffer_wdata_d0     = in_data;
+    assign line_buffer_re           = (!out_valid || out_ready);
+    assign line_buffer_raddr_d0     = cntr_fi * KK + cntr_kk;
+    assign mac_array_data_vld_d0    = (is_fst_fo_d0 ? in_valid : 1'b1);
+
+
+    // rom读之后输出延后一周期，和ram读同步
     rom #(
         .DWIDTH(P_OCH * P_ICH * W_BIT),
         .AWIDTH($clog2(WEIGHT_DEPTH)),
@@ -65,11 +104,14 @@ module conv #(
         .ROM_TYPE(W_ROM_TYPE)
     ) u_weight_rom (
         .clk  (clk),
-        .ce0  (pipe_en_frontend), // 前端使能控制
-        .addr0(weight_addr),
-        .q0   (weight_data)
+        .ce0  (pipe_en_out),
+        .addr0(weight_addr_d0),
+        .q0   (weight_data_d1)
     );
 
+    // 减少分支，第一个fo也从ram读数据，一边写一边读，读比写晚一个周期，这样后续不用判断
+    // write全是d0，read的addr比write晚一周期，d1，输出数据再晚一周期，d2
+    // 所有mac的输入数据和mac的控制信号和ram的输出数据对齐，即统一延迟到d2
     ram #(
         .DWIDTH(P_ICH * A_BIT),
         .AWIDTH(LB_AWIDTH),
@@ -77,40 +119,22 @@ module conv #(
     ) u_line_buffer (
         .clk  (clk),
         .we   (line_buffer_we),
-        .waddr(line_buffer_waddr),
-        .wdata(line_buffer_wdata),
+        .waddr(line_buffer_waddr_d0),
+        .wdata(line_buffer_wdata_d0),
         .re   (line_buffer_re),
-        .raddr(line_buffer_raddr),
-        .rdata(line_buffer_rdata)
+        .raddr(line_buffer_raddr_d1),
+        .rdata(line_buffer_rdata_d2)
     );
 
-    assign is_fst_fo            = (cntr_fo == 0);
-    assign is_fst_kk_fi         = (cntr_kk == 0) && (cntr_fi == 0);       
-    assign is_lst_kk_fi         = (cntr_kk == KK - 1) && (cntr_fi == FOLD_I - 1) && pipe_en_in;     
-    assign pipe_en_in           = is_fst_fo ? in_valid : 1'b1;
 
-    // --- 流水线使能解耦 ---
-    assign pipe_en_frontend     = pipe_en_in && pipe_en_out;
-    assign pipe_en_backend      = (pipe_en_in || is_flushing) && pipe_en_out;
-    // ----------------------------
-    
-    assign in_ready             = is_fst_fo && pipe_en_out;
-
-    assign weight_addr          = (cntr_fo * KK * FOLD_I) + cntr_fi * KK + cntr_kk;
-    assign line_buffer_we       = is_fst_fo && pipe_en_frontend; // 前端使能控制
-    assign line_buffer_waddr    = cntr_fi * KK + cntr_kk;
-    assign line_buffer_wdata    = in_data;
-    assign line_buffer_re       = !is_fst_fo && pipe_en_frontend; // 前端使能控制
-    assign line_buffer_raddr    = cntr_fi * KK + cntr_kk;
-
-    // 计数器挂载到 pipe_en_frontend
+    // 只有计数器需要全局使能，其他都由pipe_en_out控制
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cntr_hw <= 0;
             cntr_fo <= 0;
             cntr_fi <= 0;
             cntr_kk <= 0;
-        end else if (pipe_en_frontend) begin     
+        end else if (pipe_en) begin     
             if (cntr_kk == KK - 1) begin  
                 cntr_kk <= 0;
                 if (cntr_fi == FOLD_I - 1) begin
@@ -134,44 +158,40 @@ module conv #(
         end
     end
 
-    logic [P_ICH*A_BIT-1:0] in_data_d1;
-    logic                   is_fst_fo_d1;
-    logic                   in_valid_d1;
-    logic                   is_fst_kk_fi_d1;
-    logic                   is_lst_kk_fi_d1;
-    logic                   mac_array_data_vld_d1;
 
-    // 数据打拍挂载到 pipe_en_backend，保证 Flush 阶段能送入无效数据/清零信号
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            in_data_d1       <= '0;
-            is_fst_fo_d1     <= '0;
-            in_valid_d1      <= '0;
-            is_fst_kk_fi_d1  <= '0;
-            is_lst_kk_fi_d1  <= '0;
-        end else if (pipe_en_backend) begin         
-            in_data_d1       <= in_data;
-            is_fst_fo_d1     <= is_fst_fo;
-            in_valid_d1      <= in_valid;
-            is_fst_kk_fi_d1  <= is_fst_kk_fi;
-            is_lst_kk_fi_d1  <= is_lst_kk_fi;
+            weight_data_d2          <= '0;
+            line_buffer_raddr_d1    <= '0;
+            in_data_d1              <= '0;
+            in_data_d2              <= '0;
+            is_fst_fo_d1            <= '0;
+            is_fst_fo_d2            <= '0;
+            is_fst_kk_fi_d1         <= '0;
+            is_fst_kk_fi_d2         <= '0;
+            is_lst_kk_fi_d1         <= '0;
+            is_lst_kk_fi_d2         <= '0;
+            mac_array_data_vld_d1   <= '0;
+            mac_array_data_vld_d2   <= '0;
+        end else if (pipe_en_out) begin
+            weight_data_d2          <= weight_data_d1;
+            line_buffer_raddr_d1    <= line_buffer_raddr_d0;
+            in_data_d1              <= in_data;
+            in_data_d2              <= in_data_d1;
+            is_fst_fo_d1            <= is_fst_fo_d0;
+            is_fst_fo_d2            <= is_fst_fo_d1;
+            is_fst_kk_fi_d1         <= is_fst_kk_fi_d0;
+            is_fst_kk_fi_d2         <= is_fst_kk_fi_d1;
+            is_lst_kk_fi_d1         <= is_lst_kk_fi_d0;
+            is_lst_kk_fi_d2         <= is_lst_kk_fi_d1;
+            mac_array_data_vld_d1   <= mac_array_data_vld_d0;
+            mac_array_data_vld_d2   <= mac_array_data_vld_d1;
         end
     end
 
-    assign mac_array_data_vld_d1 = (is_fst_fo_d1 ? in_valid_d1 : 1'b1);
-    assign in_buf = is_fst_fo_d1 ? in_data_d1 : line_buffer_rdata;
 
-    // 延迟全部挂载到 pipe_en_backend
-    delayline #(
-        .WIDTH(1), 
-        .DEPTH(P_ICH - 1)
-    ) u_mac_vld (
-        .clk     (clk),
-        .rst_n   (rst_n),
-        .en      (pipe_en_backend), // 修改为后端使能
-        .data_in (mac_array_data_vld_d1),
-        .data_out(mac_array_data_vld)
-    );
+    // is_fst_fo和in_data都需要延迟两个周期与line_buffer_rdata_d2对齐
+    assign in_buf = is_fst_fo_d2 ? in_data_d2 : line_buffer_rdata_d2;
 
     logic        [A_BIT-1:0] x_vec[P_ICH];
     logic signed [W_BIT-1:0] w_vec[P_OCH] [P_ICH];
@@ -185,57 +205,49 @@ module conv #(
     always_comb begin
         for (int o = 0; o < P_OCH; o++) begin
             for (int i = 0; i < P_ICH; i++) begin
-                w_vec[o][i] = weight_data[(P_ICH*o+i)*W_BIT+:W_BIT]; 
+                w_vec[o][i] = weight_data_d2[(P_ICH*o+i)*W_BIT+:W_BIT]; 
             end
         end
     end
 
-    // 数据与权重斜化 (Data Skewing) 挂载到 pipe_en_backend
-    logic [A_BIT-1:0] x_vec_delayed [P_ICH];
-    logic [W_BIT-1:0] w_vec_delayed [P_OCH][P_ICH];
+    // mac数据有效，控制mac_tail，延时I-1个周期
+    delayline #(
+        .WIDTH(1), 
+        .DEPTH(P_ICH - 1)
+    ) u_mac_vld (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .en      (pipe_en_out),
+        .data_in (mac_array_data_vld_d2),
+        .data_out(mac_array_data_vld_delayed)
+    );
 
-    generate
-        for (genvar i = 0; i < P_ICH; i++) begin : gen_skew
-            delayline #(
-                .WIDTH(A_BIT), 
-                .DEPTH(i)
-            ) u_dx (
-                .clk(clk), 
-                .rst_n(rst_n), 
-                .en(pipe_en_backend),  // 修改为后端使能
-                .data_in(x_vec[i]), 
-                .data_out(x_vec_delayed[i])
-            );
-            
-            for (genvar o = 0; o < P_OCH; o++) begin : gen_w_skew
-                delayline #(
-                    .WIDTH(W_BIT), 
-                    .DEPTH(i)
-                ) u_dw (
-                    .clk(clk), 
-                    .rst_n(rst_n), 
-                    .en(pipe_en_backend),  // 修改为后端使能
-                    .data_in(w_vec[o][i]), 
-                    .data_out(w_vec_delayed[o][i])
-                );
-            end
-        end
-    endgenerate
-
-    // 每一个新的输出位置清零信号延迟挂载到 pipe_en_backend
-    logic clr_delayed;
+    // mac累加清零，控制mac_tail，延时I-1个周期
     delayline #(
         .WIDTH(1), 
         .DEPTH(P_ICH - 1)
     ) u_clr_skew (
         .clk     (clk),
         .rst_n   (rst_n),
-        .en      (pipe_en_backend), // 修改为后端使能
-        .data_in (is_fst_kk_fi_d1),
-        .data_out(clr_delayed)
+        .en      (pipe_en_out),
+        .data_in (is_fst_kk_fi_d2),
+        .data_out(is_fst_kk_fi_delayed)
     );
 
-    // 实例化 MAC 阵列，挂载到 pipe_en_backend
+    // 输出有效，与cascade[P_ICH]对齐，延迟I个周期
+    delayline #(
+        .WIDTH(1), 
+        .DEPTH(P_ICH)
+    ) u_out_vld (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .en      (pipe_en_out),
+        .data_in (is_lst_kk_fi_d2),
+        .data_out(is_lst_kk_fi_delayed)
+    );
+
+
+    // 实例化 MAC 阵列
     generate
         for (genvar o = 0; o < P_OCH; o++) begin : gen_mac_array
             conv_mac_array #(
@@ -246,48 +258,17 @@ module conv #(
             ) u_mac_array (
                 .clk    (clk),
                 .rst_n  (rst_n),
-                .en     (pipe_en_backend), // 修改为后端使能
-                .dat_vld(mac_array_data_vld),   
-                .clr    (clr_delayed),   
-                .x_vec  (x_vec_delayed),
-                .w_vec  (w_vec_delayed[o]),
+                .en     (pipe_en_out),
+                .dat_vld(mac_array_data_vld_delayed),   
+                .clr    (is_fst_kk_fi_delayed),   
+                .x_vec  (x_vec),
+                .w_vec  (w_vec[o]),
                 .acc    (acc[o])
             );
         end
     endgenerate
 
-    // --- 使用移位寄存器管理 Flush 状态及取代原本的 u_out_vld_delay ---
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            out_vld_sr <= '0;
-        end else if (pipe_en_backend) begin
-            out_vld_sr <= {out_vld_sr[P_ICH-2:0], is_lst_kk_fi_d1};
-        end
-    end
-
-    assign out_vld_pre = out_vld_sr[P_ICH-1];
-    assign is_flushing = is_lst_kk_fi_d1 | (|out_vld_sr);
-    // ------------------------------------------------------------------------
-
-    // 记录当前输出是否在流水线 stall 期间已经被读走
-    logic out_consumed;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            out_consumed <= 1'b0;
-        // 使用 pipe_en_backend 作为推进标准
-        end else if (pipe_en_backend) begin
-            out_consumed <= 1'b0; 
-        end else if (out_valid && out_ready) begin
-            out_consumed <= 1'b1; 
-        end
-    end
-
-    // 如果数据已经被读走了，就不再拉高 valid，防止重复读取
-    assign out_valid   = out_vld_pre && !out_consumed;
-    
-    // 如果数据被读走了，即使后级 out_ready 拉低也要允许流水线前进
-    assign pipe_en_out = out_ready || out_consumed; 
+    assign out_valid = is_lst_kk_fi_delayed;
 
     always_comb begin
         for (int o = 0; o < P_OCH; o++) begin
