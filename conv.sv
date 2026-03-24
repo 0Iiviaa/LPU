@@ -3,10 +3,10 @@
 // 1. 第一个fo也从ram读数据，减少分支
 // 2. 统一代码形式，方便对齐
 // 3. 数据和权重斜化放进mac内部
-// 4. 流水线驱动简化：
-//    · mac使能只看out_ready，out_ready = 1 时计算新输出，out_ready = 0 时mac的输出保持，防止丢弃有效数据
+// 4. 流水线驱动简化，逻辑：
+//    · mac使能只看out_ready，out_ready = 1 时更新输出，out_ready = 0 时输出保持，防止丢弃有效数据
 //    · in_vaild无效要让流水线停住，但是不能让mac的计算停住，防止正在计算的有效数据卡住
-//    · mac使能有效即计算，则此时mac的输入数据必须有效，所以rom和ram的读使能和mac一致，控制信号延迟使能也和mac一致
+//    · mac使能，mac输入数据和相应的控制信号需要对齐，所以rom和ram的读使能以及控制信号的delayline使能和mac一致
 //    · flush机制通过pipe_en和pipe_en_out分离实现，只需要在in_valid=0时拉低is_lst_kk_fi_d0，out_ready会在pipe_en_out驱动的延迟后拉低
 // ---------------------------------------------------
 
