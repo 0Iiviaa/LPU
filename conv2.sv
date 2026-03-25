@@ -217,7 +217,7 @@ module conv #(
     );
 
 
-    // 实例化 MAC 阵列，挂载到 pipe_en_backend
+    // 实例化 MAC 阵列
     generate
         for (genvar o = 0; o < P_OCH; o++) begin : gen_mac_array
             conv_mac_array #(
